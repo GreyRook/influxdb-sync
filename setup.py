@@ -5,11 +5,6 @@
 
 from setuptools import setup, find_packages
 
-with open('README.rst') as readme_file:
-    readme = readme_file.read()
-
-with open('HISTORY.rst') as history_file:
-    history = history_file.read()
 
 requirements = ['Click>=6.0', ]
 
@@ -38,7 +33,6 @@ setup(
     },
     install_requires=requirements,
     license="Apache Software License 2.0",
-    long_description=readme + '\n\n' + history,
     include_package_data=True,
     keywords='influxdb_sync',
     name='influxdb_sync',

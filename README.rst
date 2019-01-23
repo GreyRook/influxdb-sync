@@ -1,0 +1,4 @@
+InfluxDB Sync
+=============
+
+* Free software: Apache Software License 2.0

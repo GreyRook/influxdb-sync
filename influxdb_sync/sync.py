@@ -19,9 +19,9 @@ class Synchronizer:
 
     async def run(self):
         self.running = True
-        await asyncio.gather(self.produce(), self.consume(), self.stats())
+        await asyncio.gather(self.produce(), self.consume(), self.write_stats())
 
-    async def stats(self):
+    async def write_stats(self) -> None:
         while self.running:
             now = time.time()
             points_per_second = self.stats_data_send / (now - self.stats_time)
@@ -30,19 +30,18 @@ class Synchronizer:
             self.stats_time = now
             await asyncio.sleep(15)
 
-    async def produce(self):
+    async def produce(self) -> None:
         if not hasattr(self.src_client, 'db_info'):
             self.src_client.db_info = await DataBaseInfo.from_db(self.src_client, self.dst_db)
 
         producers = []
         for measurement in self.src_client.db_info.measurements.values():
-            # await self.produce_measurement(measurement)
             producers.append(self.produce_measurement(measurement))
         await asyncio.gather(*producers)
         
         self.running = False
     
-    async def produce_measurement(self, measurement):
+    async def produce_measurement(self, measurement) -> None:
         print(f'reading measurement {measurement.measurement_name}')
 
         overlap = 60 * 60 * 1000 * 1000 # 1 hour
@@ -75,7 +74,7 @@ class Synchronizer:
             
             start_time = entries[-1]['time']
 
-    async def _produce_from_query(self, measurement, query):
+    async def _produce_from_query(self, measurement, query:str):
         results = await self.src_client.query(query)
         entries = []
         for result in results['results']:
@@ -115,7 +114,7 @@ class Synchronizer:
         print('consume done')
 
 
-class measurementInfo:
+class MeasurementInfo:
     type_map = {
         'float': float,
         'string': str,
@@ -153,7 +152,7 @@ class measurementInfo:
                 for field_key, field_type in series['values']:
                     value_types[field_key] = self.type_map[field_type]
                     
-        return measurementInfo(db_name, measurement_name, key_names, value_types)
+        return MeasurementInfo(db_name, measurement_name, key_names, value_types)
 
 
 class DataBaseInfo:
@@ -175,7 +174,7 @@ class DataBaseInfo:
 
         measurement_infos = []
         for measurement_name in measurement_names:
-            future = measurementInfo.from_db(client, db_name, measurement_name)
+            future = MeasurementInfo.from_db(client, db_name, measurement_name)
             measurement_infos.append(future)
 
         instance = DataBaseInfo()

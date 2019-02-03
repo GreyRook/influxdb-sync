@@ -37,9 +37,9 @@ async def ensure_influx_setup(client):
     await client.write(point)
 
 
-async def gen_test_data(client, amount, seed=42):
+async def gen_test_data(client, amount, start_time=0, seed=42):
     r = random.Random(seed)
-    t = 0
+    t = start_time
     for i in range(amount):
         batch = []
         for _ in range(1000):
@@ -57,6 +57,7 @@ async def gen_test_data(client, amount, seed=42):
             }
             batch.append(entry)
         await client.write(batch)
+    return t
 
 
 async def compare(src_client, dst_client, query):
@@ -94,7 +95,8 @@ async def test_sync(influx_src, influx_dst):
             await dst_client.create_database(db='testdb')
             syncer = influxdb_sync.sync.Synchronizer(src_client, dst_client, 'testdb', 'testdb')
             
-            # test our test function
+            ### TEST a single data point
+            # data should be different
             with pytest.raises(AssertionError):
                 await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
             
@@ -102,11 +104,29 @@ async def test_sync(influx_src, influx_dst):
 
             await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
 
-            # generate a lot of test data
-            await gen_test_data(src_client, 20)
+            ### TEST with 20k data points (+ 1 old data point)
+            t = await gen_test_data(src_client, 20)
 
 
-            # test our test function
+            # data should be different
+            with pytest.raises(AssertionError):
+                await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
+            
+            await syncer.run()
+
+            await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
+
+            # data already synced - another run should skip most writes
+            # Since the last batch is always written reduce the batch size
+            syncer.src_batch_size = 1000
+            measurement = syncer.src_client.db_info.measurements['cpu_load_short']
+            writes = await syncer.produce_measurement(measurement)
+            assert syncer.backlog.qsize() == 1
+
+            ### TEST with new data after the existing data
+            await gen_test_data(src_client, 1, start_time=t)
+
+            # data should be different
             with pytest.raises(AssertionError):
                 await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
             

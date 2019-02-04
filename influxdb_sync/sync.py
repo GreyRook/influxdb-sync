@@ -5,14 +5,6 @@ import asyncio
 import aioinflux
 
 
-async def get_latest_date(client:aioinflux.InfluxDBClient, measurement) -> int:
-    return get_date(client, measurement, 'DESC')
-
-
-def get_first_date(client:aioinflux.InfluxDBClient, measurement) -> int:
-    return get_date(client, measurement, 'ASC')
-
-
 async def get_date(client:aioinflux.InfluxDBClient, measurement, order:str) -> int:
     query = f'SELECT * FROM "{measurement.measurement_name}" ORDER BY time {order} LIMIT 1'
     try:
@@ -20,6 +12,7 @@ async def get_date(client:aioinflux.InfluxDBClient, measurement, order:str) -> i
         return date_from_result(results)
     except aioinflux.client.InfluxDBError:
         return None
+
 
 def date_from_result(results):
     results = results.get('results')
@@ -31,7 +24,7 @@ def date_from_result(results):
 
 
 class Synchronizer:
-    def __init__(self, src_client:aioinflux.InfluxDBClient, dst_client:aioinflux.InfluxDBClient, 
+    def __init__(self, src_client:aioinflux.InfluxDBClient, dst_client:aioinflux.InfluxDBClient,
                  src_db:str=None, dst_db:str=None, max_queue_size=50) -> None:
         self.src_client = src_client
         self.dst_client = dst_client
@@ -42,7 +35,13 @@ class Synchronizer:
         self.dst_batch_size = 5000
         self.stats_data_send = 0
         self.stats_time = time.time()
-        self.consumer_count = 2
+        self.consumer_count = 4
+        self.producer_count = 10
+        self.reset_stats()
+
+    def reset_stats(self):
+        self.skipped_points = 0
+        self.modified_points = 0
 
     async def run(self) -> None:
         self.running = True
@@ -52,36 +51,67 @@ class Synchronizer:
 
     async def write_stats(self) -> None:
         while self.running:
-            now = time.time()
-            points_per_second = self.stats_data_send / (now - self.stats_time)
-            print(f'backlog: {self.backlog.qsize()}, datapoints/s: {points_per_second}')
-            self.stats_data_send = 0
-            self.stats_time = now
             try:
-                await asyncio.sleep(15)
+                await asyncio.sleep(30)
             except asyncio.CancelledError:
                 return
 
+            now = time.time()
+            points_per_second = self.stats_data_send / (now - self.stats_time) / 1000
+            skipped_points = self.skipped_points / 1000000
+            modified_points = self.modified_points / 1000000
+            print(f'backlog: {self.backlog.qsize()}, '
+                  f'skipped {skipped_points:.2f}M, '
+                  f'writes {modified_points:.2f}M, '
+                  f'datapoints/s: {points_per_second:.2f}k')
+            self.stats_data_send = 0
+            self.stats_time = now
+
     async def produce(self) -> None:
+        self._producer_sem = asyncio.Semaphore(self.producer_count)
+
         if not hasattr(self.src_client, 'db_info'):
             self.src_client.db_info = await DataBaseInfo.from_db(self.src_client, self.dst_db)
 
-        producers = []
         for measurement in self.src_client.db_info.measurements.values():
-            producers.append(self.produce_measurement(measurement))
-        await asyncio.gather(*producers)
+            await self.series_producer(measurement)
+        
+        # ensure all tasks are done
+        for _ in range(self.producer_count):
+            await self._producer_sem.acquire()
         
         self.running = False
-    
-    async def produce_measurement(self, measurement):
-        print(f'reading measurement {measurement.measurement_name}')
 
-        # overlap = 60 * 60 * 1000 * 1000 # 1 hour
-        start_time = await get_first_date(self.src_client, measurement)
+
+    async def series_producer(self, measurement):
+        query = f'SHOW SERIES CARDINALITY FROM {measurement.measurement_name}'
+        result = await self.src_client.query(query)
+        cardinality = result['results'][0]['series'][0]['values'][0][0]
+
+        print(f'measurement {measurement.measurement_name} with {cardinality} cardinality')
+
+        for soffset in range(cardinality):
+            worker = self.produce_series(measurement, soffset)
+            await self._producer_sem.acquire()
+            asyncio.ensure_future(worker)
+
+    async def produce_series(self, measurement, soffset):
+        try:
+            await self._produce_worker(measurement, soffset)
+        finally:
+            self._producer_sem.release()
+
+    async def _produce_worker(self, measurement, soffset):
+        select_clause = f'SELECT * FROM "{measurement.measurement_name}"'
+        slimit_clause = f'SLIMIT 1 SOFFSET {soffset}'
+        start_time = 0
+
+        max_offset_multiplier = 16
+        check_offset = self.src_batch_size * max_offset_multiplier
 
         while True:
-            query_base = f'SELECT * FROM "{measurement.measurement_name}" WHERE time >= {start_time}'
-            compare_query = f'{query_base} LIMIT 1 OFFSET {self.src_batch_size}'
+            query_base = f'{select_clause} WHERE time >= {start_time} GROUP BY * '
+            compare_query = f'{query_base} LIMIT 1 OFFSET {check_offset} {slimit_clause}'
 
             src, dst = await asyncio.gather(
                 self.src_client.query(compare_query),
@@ -90,22 +120,30 @@ class Synchronizer:
 
             if src == dst:
                 next_start = date_from_result(src)
-                # if next start is None we are at the end of the series
-                # to KISS we always sync in this case.
-                if next_start is not None:
+                if next_start is None:
+                    if max_offset_multiplier != 1:
+                        check_offset //= 2
+                        max_offset_multiplier /= 2
+                        continue
+                else:
                     start_time = next_start
+                    self.skipped_points += check_offset
+                    self.stats_data_send += check_offset
+                    if check_offset < self.src_batch_size * max_offset_multiplier:
+                        check_offset *= 2
                     continue
 
-            query = f'{query_base} LIMIT {self.src_batch_size}'
-            now = time.time()
+            check_offset = self.src_batch_size
+
+            query = f'{query_base} LIMIT {self.src_batch_size} {slimit_clause}'
             entries = await self._produce_from_query(measurement, query)
 
             await self.backlog.put(entries)
             if len(entries) < self.src_batch_size:
-                print(f'{measurement.measurement_name} done')
-                return
-            
+                return 
+
             start_time = entries[-1]['time']
+
 
     async def _produce_from_query(self, measurement, query:str):
         results = await self.src_client.query(query)
@@ -113,25 +151,26 @@ class Synchronizer:
         for result in results['results']:
             for series in result.get('series', []):
                 columns = series['columns']
+                tags = series.get('tags', {})
                 for row in series['values']:
                     entry = {
                         'measurement': measurement.measurement_name,
-                        'tags': {},
+                        'tags': tags,
                         'fields': {}
                     }
                     for i, key in enumerate(columns):
                         value = row[i]
                         if key == 'time':
                             entry['time'] = value
-                        elif key in measurement.tags:
-                            entry['tags'][key] = value
+                        # elif key in measurement.tags:
+                        #     entry['tags'][key] = value
                         elif value is not None:
                             entry['fields'][key] = measurement.values[key](value)
-                    
+
                     entries.append(entry)
-                
+
         return entries
-    
+
     async def consume(self):
         consumers = []
         for _ in range(self.consumer_count):
@@ -141,7 +180,7 @@ class Synchronizer:
             await asyncio.gather(*consumers)
         except asyncio.CancelledError:
             pass
-    
+
     def _check_done(self):
         if self.backlog.empty():
             self._stats_task.cancel()
@@ -150,16 +189,19 @@ class Synchronizer:
     async def _consume(self):
         while self.running or not self.backlog.empty():
             batch = await self.backlog.get()
-           
-            try: 
+
+            try:
                 await asyncio.shield(self.dst_client.write(batch))
-                self.stats_data_send += len(batch)
-            except:
+                point_count = len(batch)
+                self.stats_data_send += point_count
+                self.modified_points += point_count
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
                 print('failed to write')
                 print(batch)
-                raise
+                raise e
             self.backlog.task_done()
-        print('consumer done')
         self._check_done()
 
 
@@ -176,13 +218,13 @@ class MeasurementInfo:
         self.measurement_name = measurement_name
         self.tags = tags
         self.values = values
-    
+
     @classmethod
     async def from_db(self, client, db_name, measurement_name):
         # XXX prepared statements / escaping needed
         query = f'SHOW TAG KEYS ON "{db_name}" FROM "{measurement_name}"'
         keys_result = await client.query(query)
-        
+
         query = f'SHOW FIELD KEYS ON "{db_name}" FROM "{measurement_name}"'
         values_result = await client.query(query)
 
@@ -200,7 +242,7 @@ class MeasurementInfo:
                 assert series['columns'] == ['fieldKey', 'fieldType']
                 for field_key, field_type in series['values']:
                     value_types[field_key] = self.type_map[field_type]
-                    
+
         return MeasurementInfo(db_name, measurement_name, key_names, value_types)
 
 

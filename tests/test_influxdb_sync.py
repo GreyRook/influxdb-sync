@@ -93,13 +93,16 @@ async def test_sync(influx_src, influx_dst):
 
         async with InfluxDBClient(port=influx_dst.exposed_port, db='testdb') as dst_client:
             await dst_client.create_database(db='testdb')
+
+
+
             syncer = influxdb_sync.sync.Synchronizer(src_client, dst_client, 'testdb', 'testdb')
-            
+
             ### TEST a single data point
             # data should be different
             with pytest.raises(AssertionError):
                 await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
-            
+
             await syncer.run()
 
             await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
@@ -108,11 +111,15 @@ async def test_sync(influx_src, influx_dst):
             t = await gen_test_data(src_client, 20)
 
 
+
             # data should be different
             with pytest.raises(AssertionError):
                 await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
-            
+
             await syncer.run()
+
+            # await asyncio.sleep(300000)
+            await asyncio.sleep(5)
 
             await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
 
@@ -120,8 +127,11 @@ async def test_sync(influx_src, influx_dst):
             # Since the last batch is always written reduce the batch size
             syncer.src_batch_size = 1000
             measurement = syncer.src_client.db_info.measurements['cpu_load_short']
-            writes = await syncer.produce_measurement(measurement)
-            assert syncer.backlog.qsize() == 1
+            syncer.reset_stats()
+            await syncer.produce()
+            assert syncer.backlog.qsize() == 4  # one per series
+            assert syncer.skipped_points > 0
+            assert syncer.modified_points < syncer.src_batch_size
 
             ### TEST with new data after the existing data
             await gen_test_data(src_client, 1, start_time=t)
@@ -129,7 +139,7 @@ async def test_sync(influx_src, influx_dst):
             # data should be different
             with pytest.raises(AssertionError):
                 await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
-            
+
             await syncer.run()
 
             await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')

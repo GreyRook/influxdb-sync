@@ -10,6 +10,7 @@ pytest-asyncio = "*"
 pycodestyle = "*"
 mypy = "*"
 pylint = "*"
+dockerdb = "*"
 
 [packages]
 click = "*"

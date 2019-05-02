@@ -1,0 +1,9 @@
+variables:
+  CI_REGISTRY_IMAGE: ''
+  PYTHON_MODULE: 'influxdb_sync'
+
+
+include:
+  - https://gitlab.com/GreyRook/cde-test-py3/raw/57f515c92cf19eb1692f17e29c69d0f6e59381d9/gitlab-ci.yml
+
+

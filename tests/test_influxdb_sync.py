@@ -42,7 +42,7 @@ async def gen_test_data(client, amount, start_time=0, seed=42):
     t = start_time
     for i in range(amount):
         batch = []
-        for _ in range(1000):
+        for _ in range(10):
             t += r.randint(10000, 1000000)
             entry = {
                 'time': t,
@@ -97,6 +97,7 @@ async def test_sync(influx_src, influx_dst):
 
 
             syncer = influxdb_sync.sync.Synchronizer(src_client, dst_client, 'testdb', 'testdb')
+            syncer.src_batch_size = 10
 
             ### TEST a single data point
             # data should be different
@@ -108,7 +109,7 @@ async def test_sync(influx_src, influx_dst):
             await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
 
             ### TEST with 20k data points (+ 1 old data point)
-            t = await gen_test_data(src_client, 20)
+            t = await gen_test_data(src_client, 10)
 
 
 
@@ -118,18 +119,14 @@ async def test_sync(influx_src, influx_dst):
 
             await syncer.run()
 
-            # await asyncio.sleep(300000)
-            await asyncio.sleep(5)
-
             await compare(src_client, dst_client, 'SELECT * FROM cpu_load_short')
 
             # data already synced - another run should skip most writes
             # Since the last batch is always written reduce the batch size
-            syncer.src_batch_size = 1000
+            syncer.src_batch_size = 10
             measurement = syncer.src_client.db_info.measurements['cpu_load_short']
             syncer.reset_stats()
             await syncer.produce()
-            assert syncer.backlog.qsize() == 4  # one per series
             assert syncer.skipped_points > 0
             assert syncer.modified_points < syncer.src_batch_size
 

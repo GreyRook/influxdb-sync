@@ -1,8 +1,13 @@
 import time
+import logging
 import collections
 import asyncio
 
 import aioinflux
+
+
+LOG = logging.getLogger(__name__)
+# logging.basicConfig(level=logging.DEBUG)
 
 
 async def get_date(client:aioinflux.InfluxDBClient, measurement, order:str) -> int:
@@ -15,7 +20,7 @@ async def get_date(client:aioinflux.InfluxDBClient, measurement, order:str) -> i
 
 
 def date_from_result(results):
-    results = results.get('results')
+    results = results.get('results', results)
     series = results[0].get('series')
     if series:
         values = series[0]['values']
@@ -32,11 +37,11 @@ class Synchronizer:
         self.src_db = src_db
         self.dst_db = dst_db
         self.src_batch_size = 5000
-        self.dst_batch_size = 5000
+        self.dst_batch_combiner = 2
         self.stats_data_send = 0
         self.stats_time = time.time()
         self.consumer_count = 4
-        self.producer_count = 10
+        self.producer_count = 12
         self.reset_stats()
 
     def reset_stats(self):
@@ -76,7 +81,7 @@ class Synchronizer:
         for measurement in self.src_client.db_info.measurements.values():
             await self.series_producer(measurement)
         
-        # ensure all tasks are done
+        LOG.debug('wait for all producers to stop')
         for _ in range(self.producer_count):
             await self._producer_sem.acquire()
         
@@ -93,7 +98,10 @@ class Synchronizer:
         for soffset in range(cardinality):
             worker = self.produce_series(measurement, soffset)
             await self._producer_sem.acquire()
+
+            # TODO write a sliding-window await
             asyncio.ensure_future(worker)
+            # await worker
 
     async def produce_series(self, measurement, soffset):
         try:
@@ -106,40 +114,60 @@ class Synchronizer:
         slimit_clause = f'SLIMIT 1 SOFFSET {soffset}'
         start_time = 0
 
-        max_offset_multiplier = 16
+        max_offset_multiplier = 128
         check_offset = self.src_batch_size * max_offset_multiplier
+        tags_clause = ''
 
         while True:
-            query_base = f'{select_clause} WHERE time >= {start_time} GROUP BY * '
-            compare_query = f'{query_base} LIMIT 1 OFFSET {check_offset} {slimit_clause}'
+            query_base = f'{select_clause} WHERE time >= {start_time}'
+            group_by = 'GROUP BY *'
+            compare_query = f'{query_base} {group_by} LIMIT 1 OFFSET {check_offset} {slimit_clause}'
 
-            src, dst = await asyncio.gather(
-                self.src_client.query(compare_query),
-                self.dst_client.query(compare_query)
-            )
+            src = await self.src_client.query(compare_query)
+            if 'series' in src['results'][0]:
+                # TODO proper escaping
+                tags = src['results'][0]['series'][0]['tags']
+                tags = [f'{k}={repr(v)}' for k,v in tags.items()]
+                tags_clause = ' AND '.join(tags)
+                if start_time == 0:
+                    print(tags_clause)
+                query = f'{query_base} AND {tags_clause} {group_by} LIMIT 1 OFFSET {check_offset}'
+                dst = await self.dst_client.query(query)
 
-            if src == dst:
-                next_start = date_from_result(src)
-                if next_start is None:
-                    if max_offset_multiplier != 1:
-                        check_offset //= 2
-                        max_offset_multiplier /= 2
-                        continue
-                else:
-                    start_time = next_start
+                # SLIMIT seems quite buggy
+                src['results'][0]['series'] = [src['results'][0]['series'][0]]
+
+                if src == dst:
+                    # print('skip')
+                    start_time = date_from_result(src)
                     self.skipped_points += check_offset
                     self.stats_data_send += check_offset
                     if check_offset < self.src_batch_size * max_offset_multiplier:
                         check_offset *= 2
                     continue
+                else:
+                    # print('--diff')
+                    # print(compare_query)
+                    # print(src)
+                    # print(dst)
+                    # print()
+                    pass
+            else:
+                if max_offset_multiplier != 1:
+                    check_offset = self.src_batch_size
+                    max_offset_multiplier /= 2
+                    continue
+
 
             check_offset = self.src_batch_size
 
-            query = f'{query_base} LIMIT {self.src_batch_size} {slimit_clause}'
+            query = f'{query_base} {group_by} LIMIT {self.src_batch_size} {slimit_clause}'
             entries = await self._produce_from_query(measurement, query)
 
             await self.backlog.put(entries)
             if len(entries) < self.src_batch_size:
+                LOG.debug('worker measurement %s soffset %i done', measurement.measurement_name, soffset)
+                print(tags_clause, 'done')
                 return 
 
             start_time = entries[-1]['time']
@@ -166,6 +194,8 @@ class Synchronizer:
                         #     entry['tags'][key] = value
                         elif value is not None:
                             entry['fields'][key] = measurement.values[key](value)
+                        else:
+                            entry['fields'][key] = None
 
                     entries.append(entry)
 
@@ -190,6 +220,12 @@ class Synchronizer:
         while self.running or not self.backlog.empty():
             batch = await self.backlog.get()
 
+            for _ in range(self.dst_batch_combiner-2):
+                try:
+                    batch += self.backlog.get_nowait()
+                except asyncio.queues.QueueEmpty:
+                    break
+
             try:
                 await asyncio.shield(self.dst_client.write(batch))
                 point_count = len(batch)
@@ -198,11 +234,17 @@ class Synchronizer:
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                print('failed to write')
-                print(batch)
-                raise e
+                print('failed to write', len(batch))
+                # requeue in small batches
+                asyncio.ensure_future(self.requeue(batch))
+                await asyncio.sleep(0.1)
+                print(e)
             self.backlog.task_done()
         self._check_done()
+    
+    async def requeue(self, entries):
+        for i in range(0, len(entries), 100):
+            await self.backlog.put(entries[i:i+100])
 
 
 class MeasurementInfo:

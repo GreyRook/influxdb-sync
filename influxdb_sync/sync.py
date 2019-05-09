@@ -89,7 +89,7 @@ class Synchronizer:
 
 
     async def series_producer(self, measurement):
-        query = f'SHOW SERIES CARDINALITY FROM {measurement.measurement_name}'
+        query = f'SHOW SERIES CARDINALITY FROM "{measurement.measurement_name}"'
         result = await self.src_client.query(query)
         cardinality = result['results'][0]['series'][0]['values'][0][0]
 
@@ -295,7 +295,7 @@ class DataBaseInfo:
     @classmethod
     async def from_db(cls, client:aioinflux.InfluxDBClient, db_name:str):
         # XXX prepared statements / escaping needed
-        query = f'SHOW measurements ON {db_name}'
+        query = f'SHOW measurements ON "{db_name}"'
         measurements = await client.query(query)
 
         measurement_names = []

@@ -30,7 +30,7 @@ def date_from_result(results):
 
 class Synchronizer:
     def __init__(self, src_client:aioinflux.InfluxDBClient, dst_client:aioinflux.InfluxDBClient,
-                 src_db:str=None, dst_db:str=None, max_queue_size=50) -> None:
+                 src_db:str=None, dst_db:str=None, start_ts:int=0, max_queue_size=50) -> None:
         self.src_client = src_client
         self.dst_client = dst_client
         self.backlog = asyncio.Queue(maxsize=max_queue_size)
@@ -43,6 +43,7 @@ class Synchronizer:
         self.consumer_count = 4
         self.producer_count = 12
         self.reset_stats()
+        self.start_time = start_ts
 
     def reset_stats(self):
         self.skipped_points = 0
@@ -80,11 +81,11 @@ class Synchronizer:
 
         for measurement in self.src_client.db_info.measurements.values():
             await self.series_producer(measurement)
-        
+
         LOG.debug('wait for all producers to stop')
         for _ in range(self.producer_count):
             await self._producer_sem.acquire()
-        
+
         self.running = False
 
 
@@ -112,7 +113,7 @@ class Synchronizer:
     async def _produce_worker(self, measurement, soffset):
         select_clause = f'SELECT * FROM "{measurement.measurement_name}"'
         slimit_clause = f'SLIMIT 1 SOFFSET {soffset}'
-        start_time = 0
+        start_time = self.start_time
 
         max_offset_multiplier = 128
         check_offset = self.src_batch_size * max_offset_multiplier
@@ -168,7 +169,7 @@ class Synchronizer:
             if len(entries) < self.src_batch_size:
                 LOG.debug('worker measurement %s soffset %i done', measurement.measurement_name, soffset)
                 print(tags_clause, 'done')
-                return 
+                return
 
             start_time = entries[-1]['time']
 
@@ -241,7 +242,7 @@ class Synchronizer:
                 print(e)
             self.backlog.task_done()
         self._check_done()
-    
+
     async def requeue(self, entries):
         for i in range(0, len(entries), 100):
             await self.backlog.put(entries[i:i+100])

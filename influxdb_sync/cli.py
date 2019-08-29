@@ -27,14 +27,15 @@ def async_cli(f):
 @click.option('--dst-username', default=None)
 @click.option('--src-password', default=None)
 @click.option('--dst-password', default=None)
+@click.option('--start-ts', default=0, help="timestamp from which to start synchronization from, in ns.")
 @click.option('--db')
 @async_cli
-async def main(src, dst, src_port, dst_port, src_username, dst_username, src_password, dst_password, db, args=None):
+async def main(src, dst, src_port, dst_port, src_username, dst_username, src_password, dst_password, start_ts, db, args=None):
     print(src, dst, src_port, dst_port)
     async with InfluxDBClient(host=src, port=src_port, username=src_username, password=src_password, db=db) as src_client:
         async with InfluxDBClient(host=dst, port=dst_port, username=dst_username, password=dst_password, db=db) as dst_client:
             await dst_client.create_database(db=db)
-            syncer = sync.Synchronizer(src_client, dst_client, db, db)
+            syncer = sync.Synchronizer(src_client, dst_client, db, db, start_ts)
             await syncer.run()
 
     return 0
